@@ -1,0 +1,31 @@
+[package]
+name = "pg_webtransport"
+version = "0.1.0"
+authors = ["Alex Pearson <alex@alexpear.com>"]
+edition = "2021"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/NAlexPear/pg_webtransport"
+description = "Connect to Postgres databases over WebTransport"
+keywords = ["postgres", "quic", "webtransport", "http/3"]
+
+[dependencies]
+anyhow = "1.0.75"
+bytes = "1.5.0"
+futures = "0.3.29"
+http = "0.2"
+rustls-native-certs = "0.7.0"
+sec-http3 = "0.1.2"
+
+[dependencies.rustls]
+version = "0.21.0"
+features = ["dangerous_configuration"]
+
+[dependencies.tokio]
+version = "1.35.0"
+features = ["full"] # FIXME: pare this down
+
+[dependencies.quinn]
+version = "0.10.2"
+default-features = false
+features = ["runtime-tokio", "tls-rustls", "ring"]
