@@ -16,6 +16,11 @@ futures = "0.3.29"
 http = "0.2"
 rustls-native-certs = "0.7.0"
 sec-http3 = "0.1.2"
+tracing = "0.1.40"
+
+[dependencies.clap]
+version = "4.4.11"
+features = ["derive"]
 
 [dependencies.rustls]
 version = "0.21.0"
@@ -24,6 +29,10 @@ features = ["dangerous_configuration"]
 [dependencies.tokio]
 version = "1.35.0"
 features = ["full"] # FIXME: pare this down
+
+[dependencies.tracing-subscriber]
+version = "0.3.18"
+features = ["env-filter"]
 
 [dependencies.quinn]
 version = "0.10.2"
