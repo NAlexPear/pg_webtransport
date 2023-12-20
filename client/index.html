@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <title>WebTransport proxy test page</title>
+</head>
+
+<body>
+  <h1>WebTransport proxy test page</h1>
+  <p>open your dev tools for the good stuff</p>
+  <script type="module">
+    import init, {run} from './pkg/client.js'
+    await init()
+    await run()
+
+
+    // TODO: encode and decode actual postgres messages over this channel
+    // TODO: convert this to WASM and use postgres-protocol crate for actual message-passing
+  </script>
+</body>
+
+</html>

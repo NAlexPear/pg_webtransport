@@ -8,9 +8,9 @@ echo "Got cert key $SPKI"
 
 echo "Opening chromium"
 
-chromium \
+swaymsg -q "exec chromium \
   --ozone-platform=wayland \
   --enable-features=UseOzonePlatform \
   --origin-to-force-quic-on=127.0.0.1:4433 \
   --ignore-certificate-errors-spki-list=$SPKI \
-  --enable-logging --v=1
+  --enable-logging --v=1"
