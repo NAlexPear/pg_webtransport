@@ -1,30 +1,15 @@
-use anyhow::Context;
-use bytes::Bytes;
 use clap::Parser;
-use futures::AsyncWriteExt;
-use http::Method;
+use endpoint::Endpoint;
+use futures::{StreamExt, TryFutureExt};
+use proxy::Proxy;
 use rustls::{Certificate, PrivateKey};
-use sec_http3::{
-    ext::Protocol,
-    server::Connection,
-    webtransport::server::{AcceptedBi, WebTransportSession},
-};
-use std::{net::SocketAddrV4, path::PathBuf, sync::Arc, time::Duration};
-use tokio::net::TcpStream;
+use session::Session;
+use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
-// TODO: what's the *actual* goal with this project?
-//
-// three levels of proxying
-// 1. just a WebTransport <-> TCP proxy (postgres is just one thing that speaks TCP, so we get
-//    that for "free", but it's up to the client to handle the entire connection/protocol)
-// 2. a WebTransport <-> (postgres startup sequence on TCP connection) + TCP proxy
-//    (negotiating the actual upstream handshake then forwarding subsequent bytes)
-// 3. a higher-level query interface (statement + parameters)
-//
-// we should start with the first, then figure out how to integrate this interface
-// with existing web auth strategies to handle the second case
-// (e.g. using NGINX + Kratos to auth via Cookie and set the Postgres user via header)
+mod endpoint;
+mod proxy;
+mod session;
 
 /// Startup values for this server, provided by arguments when the binary is invoked.
 #[derive(Parser, Debug)]
@@ -79,111 +64,22 @@ async fn main() -> anyhow::Result<()> {
     tls_config.alpn_protocols = alpn;
 
     // set up the QUIC endpoint listener corresponding to a single UDP socket that may host many connections
-    let mut transport_config = quinn::TransportConfig::default();
-    transport_config.keep_alive_interval(Some(Duration::from_secs(2)));
-    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(tls_config));
-    server_config.transport_config(transport_config.into());
-    let address = SocketAddrV4::new([127, 0, 0, 1].into(), configuration.port);
-    let endpoint = quinn::Endpoint::server(server_config, address.into())?;
-    tracing::info!("listening at {address}");
-
-    // spawn tasks to handle each QUIC connection attempt
-    while let Some(connection_attempt) = endpoint.accept().await {
-        tokio::spawn(async move {
-            if let Err(error) = async {
-                // generate the Session and an initial bidirectional stream from the connection attempt
-                let session = start_session(connection_attempt).await?;
-
-                // handle bidirectional streams, since that's the only type of WebTransport
-                // type that makes sense for a database connection
-                let request = session
-                    .accept_bi()
-                    .await?
-                    .ok_or(anyhow::anyhow!("Unsupported stream type requested"))?;
-
-                let AcceptedBi::BidiStream(_, mut stream) = request else {
-                    // FIXME: handle these additional requests over the same connection
-                    todo!("handle additional http3 requests over this stream");
-                };
-
-                tracing::debug!(
-                    session_id = ?session.session_id(),
-                    "Bidirectional Stream initiated"
-                );
-
-                // send a greeting to the client for testing purposes
-                stream.write_all(b"hello webtransport!").await?;
-
-                // proxy this WebTransport stream to a TcpStream
-                let upstream =
-                    SocketAddrV4::new([127, 0, 0, 1].into(), configuration.upstream_port);
-                let mut tcp = TcpStream::connect(upstream)
-                    .await
-                    .context("Failed to connect to upstream TCP target")?;
-                tokio::io::copy_bidirectional(&mut stream, &mut tcp).await?;
-                tracing::debug!("finished with bidirectional stream");
-                anyhow::Ok(())
-            }
-            .await
-            {
-                tracing::error!(%error, "Stream error");
-            }
-        });
-    }
+    Endpoint::new(tls_config)
+        .listen(configuration.port)?
+        .for_each(|connection_attempt| async {
+            // spawn a task to handle each QUIC connection attempt
+            tokio::spawn(
+                async move {
+                    let session = Session::start(connection_attempt).await?;
+                    let stream = session.accept_bidirectional().await?;
+                    Proxy::start(stream, configuration.upstream_port).await
+                }
+                .inspect_err(|error| {
+                    tracing::error!(%error, "Stream error");
+                }),
+            );
+        })
+        .await;
 
     Ok(())
-}
-
-/// Type alias for the flavor of WebTransport session that this server uses
-type Session = WebTransportSession<sec_http3::sec_http3_quinn::Connection, Bytes>;
-
-/// Upgrade a QUIC connection to an HTTP3 connection and negotiate a new WebTransport session.
-#[tracing::instrument(skip(connection_attempt))]
-async fn start_session(connection_attempt: quinn::Connecting) -> anyhow::Result<Session> {
-    tracing::debug!(
-        remote = %connection_attempt.remote_address(),
-        "new connection attempted",
-    );
-    let connection = connection_attempt.await?;
-    let connection = sec_http3::sec_http3_quinn::Connection::new(connection);
-    let mut h3: Connection<_, Bytes> = sec_http3::server::builder()
-        .enable_webtransport(true)
-        .enable_connect(true)
-        .enable_datagram(true)
-        .max_webtransport_sessions(1)
-        .send_grease(true)
-        .build(connection)
-        .await?;
-
-    tracing::debug!("new HTTP/3 connection established");
-
-    // handle stream requests over the new HTTP3 connection
-    // TODO: we should be able to establish multiple WebTransport Sessions
-    // over the same underlying HTTP/3 connection, right? That'd require something custom
-    // for the third argument to WebTransportSession::accept, though, as that takes
-    // ownership of the *entire* h3 connection.
-    let (request, stream) = h3
-        .accept()
-        .await?
-        .ok_or(anyhow::anyhow!("Connection closed"))?;
-
-    // verify that this is really a WebTransport request
-    let extensions = request.extensions();
-    anyhow::ensure!(
-        matches!(request.method(), &Method::CONNECT),
-        "Request was not a proper CONNECT",
-    );
-    anyhow::ensure!(
-        extensions.get() == Some(&Protocol::WEB_TRANSPORT),
-        "Request was not using the WEB_TRANSPORT protocol",
-    );
-    tracing::debug!("new WebTransport session requested");
-
-    // build a real session from this request
-    let session = WebTransportSession::accept(request, stream, h3).await?;
-    tracing::debug!(
-        session_id = ?session.session_id(),
-        "WebTransport session initiated"
-    );
-    Ok(session)
 }
