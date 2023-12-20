@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use futures::AsyncWriteExt;
 use http::Method;
 use sec_http3::{
     ext::Protocol,
@@ -79,15 +78,12 @@ impl Session {
             .await?
             .ok_or(anyhow::anyhow!("Unsupported stream type requested"))?;
 
-        let AcceptedBi::BidiStream(_, mut stream) = request else {
+        let AcceptedBi::BidiStream(_, stream) = request else {
             // FIXME: handle these additional requests over the same connection
             todo!("handle additional http3 requests over this stream");
         };
 
         tracing::debug!("Bidirectional Stream initiated");
-
-        // send a greeting to the client for testing purposes
-        stream.write_all(b"hello webtransport!").await?;
         Ok(stream)
     }
 }

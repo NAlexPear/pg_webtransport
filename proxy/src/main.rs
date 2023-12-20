@@ -11,6 +11,9 @@ mod endpoint;
 mod proxy;
 mod session;
 
+// TODO: switch over to wtransport for a simpler server, perhaps?
+// https://github.com/BiagioFesta/wtransport
+
 /// Startup values for this server, provided by arguments when the binary is invoked.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
