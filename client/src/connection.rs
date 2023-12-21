@@ -85,6 +85,7 @@ pub struct Startup(Connection);
 
 impl Startup {
     /// Run through the startup and auth sequences to prepare a Connection for real use
+    // TODO: handle this on the proxy side instead of here
     pub async fn start(
         mut self,
         params: Vec<(&'static str, &'static str)>,
