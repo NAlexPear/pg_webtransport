@@ -34,6 +34,7 @@ features = [
   "WebTransportSendStream",
   "ReadableStreamDefaultReader",
   "WritableStreamDefaultWriter",
+  "TextDecoder",
 ]
 
 [dev-dependencies]

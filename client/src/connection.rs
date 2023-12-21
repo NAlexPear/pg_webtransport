@@ -33,25 +33,10 @@ impl Connection {
     // TODO: rewrite this as a Framed stream + Codec
     pub async fn decode(&mut self) -> Result<Option<Message>, JsValue> {
         loop {
-            // attempt to extract a header from the queue
-            let header = Header::parse(&self.pending).map_err(|error| {
-                JsValue::from(format!(
-                    "Error parsing the header from a backend message: {error}"
-                ))
-            })?;
-
-            match header {
-                // parse the Message if we have enough data to work with
-                Some(header) if self.pending.len() >= (header.len() as usize + 1) => {
-                    return Message::parse(&mut self.pending.split_to(header.len() as usize + 1))
-                        .map_err(|error| {
-                            JsValue::from(format!(
-                                "Error parsing the next message from the backend: {error}"
-                            ))
-                        });
-                }
-                // if there's not at least a message's worth of data, wait for another chunk from the stream
-                _ => {
+            match self.decode_pending()? {
+                Some(message) => return Ok(Some(message)),
+                None => {
+                    // if there's not at least a message's worth of data, wait for another chunk from the stream
                     let chunk = JsFuture::from(self.read.read()).await?;
                     let value = js_sys::Reflect::get(&chunk, &"value".into())
                         .map(|value| Uint8Array::new(&value))?;
@@ -67,44 +52,58 @@ impl Connection {
             }
         }
     }
-}
 
-/// Finite State Machine for the startup of a Connection.
-/// Full Connections should only be derived by successfully finalizing a StartupConnection
-pub enum Startup {
-    Start(Connection),
-    Auth(Connection),
-}
+    /// Decode a single message from the pending queue without re-fetching the data from upstream
+    fn decode_pending(&mut self) -> Result<Option<Message>, JsValue> {
+        // attempt to extract a header from the queue
+        let header = Header::parse(&self.pending).map_err(|error| {
+            JsValue::from(format!(
+                "Error parsing the header from a backend message: {error}"
+            ))
+        })?;
 
-impl Startup {
-    /// Send the startup message if it's proper to do so
-    pub async fn start(self, params: Vec<(&'static str, &'static str)>) -> Result<Self, JsValue> {
-        match self {
-            Self::Start(connection) => {
-                let mut buffer = BytesMut::new();
-                postgres_protocol::message::frontend::startup_message(params, &mut buffer)
+        match header {
+            // parse the Message if we have enough data to work with
+            Some(header) if self.pending.len() >= (header.len() as usize + 1) => {
+                return Message::parse(&mut self.pending.split_to(header.len() as usize + 1))
                     .map_err(|error| {
-                        JsValue::from(format!("Error generating startup message: {error}"))
-                    })?;
-                connection.encode(buffer).await?;
-                Ok(Self::Auth(connection))
+                        JsValue::from(format!(
+                            "Error parsing the next message from the backend: {error}"
+                        ))
+                    });
             }
-            _ => Ok(self),
+
+            // if there's not at least a message's worth of data, we're done
+            _ => Ok(None),
         }
     }
+}
 
-    /// Authenticate the startup credentials on the Connection
-    pub async fn authenticate(self) -> Result<Connection, JsValue> {
-        match self {
-            Self::Auth(mut connection) => match connection.decode().await? {
-                Some(Message::AuthenticationSasl(_body)) => sasl(connection).await,
-                Some(_) => Err(JsValue::from("Unsupported backend message type")),
-                None => Err(JsValue::from("Connection closed")),
-            },
-            _ => Err(JsValue::from(
-                "Authentication called before the connection was ready",
-            )),
+/// Connection-preparing wrapper around the startup sequence of a database Connection.
+/// Full Connections should only be derived by successfully completing a Startup.
+pub struct Startup(Connection);
+
+impl Startup {
+    /// Run through the startup and auth sequences to prepare a Connection for real use
+    pub async fn start(
+        mut self,
+        params: Vec<(&'static str, &'static str)>,
+    ) -> Result<Connection, JsValue> {
+        // send the startup message
+        let mut buffer = BytesMut::new();
+        postgres_protocol::message::frontend::startup_message(params, &mut buffer)
+            .map_err(|error| JsValue::from(format!("Error generating startup message: {error}")))?;
+        self.0.encode(buffer).await?;
+
+        // handle the next message for authentication
+        match self.0.decode().await? {
+            Some(Message::AuthenticationSasl(_body)) => sasl(&mut self.0).await?,
+            Some(_) => return Err(JsValue::from("Unsupported backend message type")),
+            None => return Err(JsValue::from("Connection closed")),
         }
+
+        // return the inner connection
+        Ok(self.0)
     }
 }
 
@@ -120,7 +119,7 @@ impl TryFrom<WebTransportBidirectionalStream> for Startup {
 
         let write = stream.writable().get_writer()?;
 
-        Ok(Self::Start(Connection {
+        Ok(Self(Connection {
             read,
             write,
             pending: BytesMut::new(),
@@ -129,7 +128,7 @@ impl TryFrom<WebTransportBidirectionalStream> for Startup {
 }
 
 /// Handle SASL-based authentication
-async fn sasl(mut connection: Connection) -> Result<Connection, JsValue> {
+async fn sasl(connection: &mut Connection) -> Result<(), JsValue> {
     // send the initial SASL message
     let mut buffer = BytesMut::new();
     let mut scram = ScramSha256::new(b"supersecretpassword", ChannelBinding::unsupported());
@@ -177,23 +176,22 @@ async fn sasl(mut connection: Connection) -> Result<Connection, JsValue> {
         .finish(body.data())
         .map_err(|error| JsValue::from(format!("Error finalizing SASL handshake: {error}")))?;
 
-    // read the connection information from the stream
-    match connection.decode().await? {
-        Some(
-            Message::BackendKeyData(..)
-            | Message::ParameterStatus(..)
-            | Message::ReadyForQuery(_)
-            | Message::AuthenticationOk,
-        ) => {
-            // TODO: use the backend or parameter data
-            log("Continuing with connection");
+    // read the connection information from the stream until we get to a terminal state
+    loop {
+        match connection.decode().await? {
+            Some(
+                Message::BackendKeyData(..)
+                | Message::ParameterStatus(..)
+                | Message::AuthenticationOk,
+            ) => {
+                // TODO: use the backend or parameter data
+            }
+            Some(Message::ReadyForQuery(..)) => return Ok(()),
+            Some(Message::ErrorResponse(body)) => return Err(format_error(body)),
+            Some(_) => return Err(JsValue::from("Unexpected backend message type")),
+            None => return Err(JsValue::from("Connection closed during authentication")),
         }
-        Some(Message::ErrorResponse(body)) => return Err(format_error(body)),
-        Some(_) => return Err(JsValue::from("Unexpected backend message type")),
-        None => return Err(JsValue::from("Connection closed during authentication")),
     }
-
-    Ok(connection)
 }
 
 /// Format Error response bodies as useful JsValues for logging
